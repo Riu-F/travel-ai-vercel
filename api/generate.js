@@ -36,7 +36,7 @@ export default async function handler(req, res) {
           // Prefer JSON, but many Wordware apps stream NDJSON lines:
           Accept: 'text/event-stream, application/json;q=0.9, */*;q=0.8'
         },
-        body: JSON.stringify({ inputs, version: '^2.1' }),
+        body: JSON.stringify({ inputs, version: '^3.2' }),
         signal: controller.signal
       }
     ).finally(() => clearTimeout(timeout));
