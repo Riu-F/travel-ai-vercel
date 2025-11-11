@@ -1,7 +1,9 @@
 // api/generate.js
 //
-// Filters Wordware's multi-step output so ONLY the final JSON (between
-// __FINAL_JSON_START__ and __FINAL_JSON_END__) is returned to the client.
+// Simple proxy to Wordware "released app".
+// - Expects { inputs, version? } in the request body
+// - Forwards to Wordware
+// - Returns { json, text } to the client
 
 export default async function handler(req, res) {
   // --- CORS ---
@@ -14,192 +16,99 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  try {
-    const { inputs } = req.body || {};
-    if (!inputs) return res.status(400).json({ error: 'Missing inputs' });
+  const apiKey =
+    process.env.WORDWARE_API_KEY ||
+    process.env.NEXT_PUBLIC_WORDWARE_API_KEY; // just in case
 
-    // So Wordware schema validations don't fail
-    if (!inputs.Persona_TravelHistory || !inputs.Persona_TravelHistory.trim()) {
-      inputs.Persona_TravelHistory = 'None';
+  if (!apiKey) {
+    return res.status(500).json({ error: 'WORDWARE_API_KEY not configured' });
+  }
+
+  try {
+    const body = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
+    const inputs = body.inputs;
+    const version = body.version || '^1.0';
+
+    if (!inputs || typeof inputs !== 'object') {
+      return res.status(400).json({ error: 'Missing or invalid inputs' });
     }
 
-    // --- Call Wordware (allow streaming or JSON) ---
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 1000 * 300); // 5 min
-    const r = await fetch(
-      `https://app.wordware.ai/api/released-app/${process.env.WORDWARE_PROMPT_ID}/run`,
+    // NOTE:
+    // New app fields are:
+    // name, destination, country_origin, trip_dates, length_of_stay,
+    // age_range, occupation, travel_purpose, travel_experience,
+    // interests, budget_level, group_type
+    // (No more Persona_TravelHistory / Persona_* stuff.)
+
+    // Prefer env var if you want; otherwise fall back to the hard-coded ID
+    const appId =
+      process.env.WORDWARE_APP_ID ||
+      process.env.WORDWARE_PROMPT_ID || // if you reuse the same var
+      '54801f70-9c87-438e-872a-be47eb1eb222';
+
+    const upstream = await fetch(
+      `https://app.wordware.ai/api/released-app/${appId}/run`,
       {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${process.env.WORDWARE_API_KEY}`,
-          'Content-Type': 'application/json',
-          // Prefer JSON, but many Wordware apps stream NDJSON lines:
-          Accept: 'text/event-stream, application/json;q=0.9, */*;q=0.8'
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json'
         },
-        body: JSON.stringify({ inputs, version: '^3.3' }),
-        signal: controller.signal
+        body: JSON.stringify({ inputs, version })
       }
-    ).finally(() => clearTimeout(timeout));
+    );
 
-    if (!r.ok) {
-      const errText = await safeReadText(r);
-      return res.status(r.status).json({ error: 'Wordware API error', detail: errText });
+    const contentType = upstream.headers.get('content-type') || '';
+    const text = await upstream.text();
+
+    if (!upstream.ok) {
+      let detail = text;
+      try {
+        const parsed = JSON.parse(text);
+        detail = parsed.error || parsed.message || text;
+      } catch {
+        // ignore parse errors
+      }
+      return res
+        .status(upstream.status)
+        .json({ error: 'Wordware API error', detail });
     }
 
-    // Read the entire response body as text
-    const raw = await safeReadText(r);
-
-    // Try to reconstruct the "visible" content from stream lines (if any)
-    const assembled = assembleFromStreamLines(raw);
-
-    // Prefer assembled stream text; otherwise fall back to raw JSON/text
-    const visible = assembled || extractVisibleFromJsonBlob(raw) || raw || '';
-
-    // Extract only the final JSON between markers
-    const finalSlice = extractBetweenMarkers(visible, '__FINAL_JSON_START__', '__FINAL_JSON_END__');
-
-    if (!finalSlice) {
-      // As a fallback, try to find the last balanced JSON object in the visible text
-      const guessed = findLastBalancedJson(visible);
-      if (!guessed) {
-        return res.status(422).json({
-          error: 'FINAL markers not found',
-          detail: 'Expected __FINAL_JSON_START__ ... __FINAL_JSON_END__ in the final step output.',
-          preview: visible.slice(-800) // tail preview for debugging
-        });
+    // Try to interpret response as JSON and pull out the useful payload.
+    if (contentType.includes('application/json')) {
+      let raw;
+      try {
+        raw = JSON.parse(text);
+      } catch (e) {
+        // If parsing fails for some reason, just pass raw text.
+        return res.status(200).json({ json: null, text });
       }
-      // Attempt to parse guessed JSON
-      const parsed = tryParseJson(guessed);
-      if (!parsed.ok) {
-        return res.status(422).json({
-          error: 'Unable to parse final JSON (fallback)',
-          detail: parsed.error,
-          preview: guessed.slice(0, 800)
-        });
-      }
-      return res.status(200).json({ json: parsed.value, text: guessed });
-    }
 
-    // Clean and parse the marked JSON slice
-    const cleaned = cleanupJsonSlice(finalSlice);
-    const parsed = tryParseJson(cleaned);
-    if (!parsed.ok) {
-      return res.status(422).json({
-        error: 'Unable to parse final JSON (marked)',
-        detail: parsed.error,
-        preview: cleaned.slice(0, 800)
+      // Your sample output looks like the "payload" already:
+      // { title, intro_paragraph, sections[], closing_line, hidden_note }
+      // But just in case Wordware wraps it, try common patterns.
+      let payload = raw;
+      if (raw && typeof raw === 'object') {
+        if (raw.output && typeof raw.output === 'object') {
+          payload = raw.output;
+        } else if (raw.json && typeof raw.json === 'object') {
+          payload = raw.json;
+        }
+      }
+
+      return res.status(200).json({
+        json: payload,
+        text: JSON.stringify(payload, null, 2)
       });
     }
 
-    // Success: return both machine- and human-friendly forms
-    return res.status(200).json({ json: parsed.value, text: cleaned });
+    // Non-JSON response: just pass text through
+    return res.status(200).json({ json: null, text });
   } catch (err) {
-    const msg = String(err && err.name === 'AbortError' ? 'Upstream timeout' : err);
-    return res.status(500).json({ error: 'Server error', detail: msg });
+    console.error('generate.js error:', err);
+    return res.status(500).json({
+      error: 'Server error',
+      detail: err?.message || String(err)
+    });
   }
-}
-
-/* -------------------- helpers -------------------- */
-
-async function safeReadText(resp) {
-  try {
-    return await resp.text();
-  } catch {
-    // Undici edge-case: if .text() fails, try stream manual read
-    if (!resp.body) return '';
-    const decoder = new TextDecoder('utf-8');
-    let out = '';
-    for await (const chunk of resp.body) out += decoder.decode(chunk, { stream: true });
-    return out;
-  }
-}
-
-// Assemble text from NDJSON/SSE lines where each line is JSON with { value: { type:"chunk", value:"..." } }
-function assembleFromStreamLines(raw) {
-  if (!raw) return '';
-  let out = '';
-  const lines = raw.split('\n');
-  for (const line of lines) {
-    const s = line.trim();
-    if (!s) continue;
-    try {
-      const obj = JSON.parse(s);
-      if (obj?.value?.type === 'chunk' && typeof obj.value.value === 'string') {
-        out += obj.value.value;
-      } else if (typeof obj.output === 'string') {
-        out += obj.output;
-      } else if (typeof obj.text === 'string') {
-        out += obj.text;
-      }
-    } catch {
-      // ignore non-JSON lines
-    }
-  }
-  return out;
-}
-
-// If the response was a single JSON object, try to pull a textual field from it
-function extractVisibleFromJsonBlob(raw) {
-  try {
-    const obj = JSON.parse(raw);
-    if (obj && typeof obj === 'object') {
-      if (typeof obj.text === 'string') return obj.text;
-      if (typeof obj.output === 'string') return obj.output;
-      // Sometimes the object IS already the final JSON:
-      if (obj.hero || obj.meta || obj.sections) return JSON.stringify(obj);
-    }
-  } catch {}
-  return '';
-}
-
-// Extract text between markers (first match)
-function extractBetweenMarkers(s, startTag, endTag) {
-  const a = s.indexOf(startTag);
-  if (a === -1) return null;
-  const b = s.indexOf(endTag, a + startTag.length);
-  if (b === -1) return null;
-  return s.slice(a + startTag.length, b).trim();
-}
-
-// Clean common wrapper artefacts (backticks, stray code fences, BOMs)
-function cleanupJsonSlice(s) {
-  return s
-    .replace(/^\uFEFF/, '')            // strip BOM
-    .replace(/^```(?:json)?/i, '')     // leading fence
-    .replace(/```$/i, '')              // trailing fence
-    .trim();
-}
-
-// Try to parse JSON with a helpful error
-function tryParseJson(s) {
-  try {
-    return { ok: true, value: JSON.parse(s) };
-  } catch (e) {
-    return { ok: false, error: String(e && e.message ? e.message : e) };
-  }
-}
-
-// Scan for the last balanced {...} object within the string
-function findLastBalancedJson(s) {
-  let start = -1;
-  let depth = 0;
-  const segments = [];
-  for (let i = 0; i < s.length; i++) {
-    const ch = s[i];
-    if (ch === '{') {
-      if (depth === 0) start = i;
-      depth++;
-    } else if (ch === '}') {
-      if (depth > 0) {
-        depth--;
-        if (depth === 0 && start !== -1) {
-          segments.push([start, i + 1]);
-          start = -1;
-        }
-      }
-    }
-  }
-  if (!segments.length) return null;
-  const [a, b] = segments[segments.length - 1];
-  return s.slice(a, b).trim();
 }
